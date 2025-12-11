@@ -145,7 +145,8 @@ class ContextualLens:
         chat_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(text=[chat_text], images=[image], return_tensors="pt")
 
-        patch_grid = self._infer_patch_grid(inputs)
+        num_image_tokens = (inputs["input_ids"][0] == self.image_token_id).sum().item()
+        patch_grid = self._infer_patch_grid(inputs, num_image_tokens)
 
         tensor_inputs: Dict[str, Any] = {}
         for k, v in inputs.items():
@@ -155,9 +156,11 @@ class ContextualLens:
             else:
                 tensor_inputs[k] = v
         tensor_inputs["prompt_length"] = tensor_inputs["input_ids"].shape[1]
-        tensor_inputs["image_token_mask"] = (tensor_inputs["input_ids"][0] == self.image_token_id)[: tensor_inputs["prompt_length"]]
+        tensor_inputs["image_token_mask"] = (tensor_inputs["input_ids"][0] == self.image_token_id)[
+            : tensor_inputs["prompt_length"]
+        ]
         tensor_inputs["patch_grid"] = patch_grid
-        tensor_inputs["processed_image_size"] = self._processed_image_size(inputs)
+        tensor_inputs["processed_image_size"] = self._processed_image_size(inputs, patch_grid)
         return tensor_inputs
 
     def _generate(
@@ -326,12 +329,20 @@ class ContextualLens:
             return getattr(self.model.config, "image_token_id")
         return None
 
-    def _infer_patch_grid(self, inputs: Dict[str, Any]) -> Tuple[int, int]:
+    def _infer_patch_grid(self, inputs: Dict[str, Any], num_image_tokens: int) -> Tuple[int, int]:
         if "image_grid_thw" in inputs:
-            grid = inputs["image_grid_thw"][0, 0].tolist()  # (T, H, W)
-            return int(grid[1]), int(grid[2])
+            grid_tensor = inputs["image_grid_thw"]
+            if grid_tensor.dim() == 2:
+                grid_list = grid_tensor[0].tolist()  # (T, H, W)
+            elif grid_tensor.dim() == 3:
+                grid_list = grid_tensor[0, 0].tolist()
+            else:
+                grid_list = grid_tensor.view(-1).tolist()
+            if len(grid_list) >= 3:
+                h, w = int(grid_list[1]), int(grid_list[2])
+                if h * w == num_image_tokens:
+                    return h, w
 
-        num_image_tokens = (inputs["input_ids"][0] == self.image_token_id).sum().item()
         root = int(math.isqrt(num_image_tokens))
         if root * root == num_image_tokens:
             return root, root
@@ -344,16 +355,28 @@ class ContextualLens:
                     best = (h, w)
         return best
 
-    def _processed_image_size(self, inputs: Dict[str, Any]) -> Tuple[int, int]:
+    def _processed_image_size(self, inputs: Dict[str, Any], patch_grid: Tuple[int, int]) -> Tuple[int, int]:
+        if "image_grid_thw" in inputs:
+            grid_tensor = inputs["image_grid_thw"]
+            if grid_tensor.numel() >= 3:
+                if grid_tensor.dim() == 2:
+                    _, h, w = grid_tensor[0].tolist()
+                elif grid_tensor.dim() == 3:
+                    _, h, w = grid_tensor[0, 0].tolist()
+                else:
+                    flat = grid_tensor.view(-1).tolist()
+                    h, w = flat[1], flat[2]
+                return (int(h), int(w))
+
         if "pixel_values" not in inputs:
-            return (1, 1)
+            return patch_grid
         tensor = inputs["pixel_values"]
         if tensor.dim() == 5:
             _, _, _, h, w = tensor.shape
         elif tensor.dim() == 4:
             _, _, h, w = tensor.shape
         else:
-            h = w = 1
+            h, w = patch_grid
         return (h, w)
 
     def _resolve_layer(self, requested: Optional[int], layer_count: int, default: int) -> int:
